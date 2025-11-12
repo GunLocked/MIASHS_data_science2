@@ -1,0 +1,651 @@
+---
+title: "Sélection de variables en régression — scénario avec dépendance (blocs corrélés)"
+author: "Ryan Mekki"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(leaps)
+library(MASS)
+library(tibble)
+library(ggplot2)
+library(tidyr)
+```
+
+##Selection avec différents critères
+
+```{r Selection avec différents critères}
+getBestSubsetCp <- function(X, y) {
+  # Conversion en data frame si nécessaire
+  data <- as.data.frame(cbind(y, X))
+  colnames(data)[1] <- "y"
+  
+  # Recherche exhaustive avec regsubsets
+  regfit <- regsubsets(y ~ ., data = data, nvmax = ncol(X), method = "exhaustive")
+  
+  # Récupération du résumé
+  reg_summary <- summary(regfit)
+  
+  # Sélection du meilleur modèle selon Cp
+  best_model_idx <- which.min(reg_summary$cp)
+  
+  # Variables sélectionnées
+  selected_vars <- reg_summary$which[best_model_idx, -1]  # -1 pour enlever l'intercept
+  
+  # Estimation des coefficients pour le modèle sélectionné
+  p <- ncol(X)
+  beta <- rep(0, p)
+  
+  if (sum(selected_vars) > 0) {
+    X_selected <- X[, selected_vars, drop = FALSE]
+    model <- lm(y ~ X_selected)
+    beta[selected_vars] <- coef(model)[-1]  # -1 pour enlever l'intercept
+  }
+  
+  return(beta)
+}
+```
+
+```{r Stepwise Selection}
+getStepwiseAIC <- function(X, y) {
+  # Assurer que X a des noms de colonnes
+  if (is.null(colnames(X))) {
+    colnames(X) <- paste0("V", 1:ncol(X))
+  }
+  
+  data <- as.data.frame(cbind(y, X))
+  colnames(data)[1] <- "y"
+  
+  model_init <- lm(y ~ 1, data = data)
+  model_full <- lm(y ~ ., data = data)
+  
+  model_step <- step(model_init, 
+                     scope = list(lower = model_init, upper = model_full),
+                     direction = "forward",
+                     k = 2,
+                     trace = 0)
+  
+  p <- ncol(X)
+  beta <- rep(0, p + 1)
+  names(beta) <- c("Intercept", colnames(X))
+  
+  coefs_all <- coef(model_step)
+  beta[1] <- coefs_all[1]  # intercept
+  
+  if (length(coefs_all) > 1) {
+    var_names <- names(coefs_all)[-1]
+    var_indices <- match(var_names, colnames(X))
+    beta[var_indices + 1] <- coefs_all[-1]
+  }
+  
+  return(beta)
+}
+```
+
+
+```{r }
+getStepwiseBIC <- function(X, y) {
+
+  if (is.null(colnames(X))) {
+    colnames(X) <- paste0("V", 1:ncol(X))
+  }
+  
+  data <- as.data.frame(cbind(y, X))
+  colnames(data)[1] <- "y"
+  
+  model_init <- lm(y ~ 1, data = data)
+  model_full <- lm(y ~ ., data = data)
+  
+  n <- length(y)
+  model_step <- step(model_init, 
+                     scope = list(lower = model_init, upper = model_full),
+                     direction = "backward",
+                     k = log(n),
+                     trace = 0)
+  
+  p <- ncol(X)
+  beta <- rep(0, p + 1)
+  names(beta) <- c("Intercept", colnames(X))
+  
+  coefs_all <- coef(model_step)
+  beta[1] <- coefs_all[1]
+  
+  if (length(coefs_all) > 1) {
+    var_names <- names(coefs_all)[-1]
+    var_indices <- match(var_names, colnames(X))
+    beta[var_indices + 1] <- coefs_all[-1]
+  }
+  
+  return(beta)
+}
+```
+
+
+
+# 3. Méthodes de référence
+
+```{r Méthodes de référence}
+getOLS <- function(X, y, alpha = 0.05) {
+  # Moindres carrés ordinaires avec test de significativité
+  # alpha : seuil de significativité (défaut 5%)
+  
+  # Assurer que X a des noms de colonnes
+  if (is.null(colnames(X))) {
+    colnames(X) <- paste0("V", 1:ncol(X))
+  }
+  
+  model <- lm(y ~ X)
+  model_summary <- summary(model)
+  
+  # Récupération des p-values
+  p_values <- model_summary$coefficients[, "Pr(>|t|)"]
+  
+  # Initialisation de beta
+  p <- ncol(X)
+  beta <- rep(0, p + 1)
+  names(beta) <- c("Intercept", colnames(X))
+  
+  # L'intercept est toujours gardé
+  beta[1] <- coef(model)[1]
+  
+  # Garder seulement les coefficients significatifs
+  for (i in 2:length(p_values)) {
+    if (p_values[i] < alpha) {
+      beta[i] <- coef(model)[i]
+    }
+  }
+  
+  return(beta)
+}
+```
+
+```{r }
+getOracleOLS <- function(X, y, S_star) {
+  # Moindres carrés oracle avec le vrai support S_star
+  # S_star est un vecteur logique ou d'indices indiquant les vraies variables
+  p <- ncol(X)
+  beta <- rep(0, p)
+  
+  if (sum(S_star) > 0) {
+    X_oracle <- X[, S_star, drop = FALSE]
+    model <- lm(y ~ X_oracle)
+    beta[S_star] <- coef(model)[-1]
+  }
+  
+  return(beta)
+}
+```
+
+
+```{r Fonction de génération de données linéaires}
+generate.lm <- function(n.train, p, p0, sigma2, n.test = 10 * n.train) {
+  # Génération des indices apprentissage / test
+  n <- n.train + n.test
+  train <- 1:n.train
+  test <- (n.train + 1):n
+  
+  # Vrai vecteur de coefficients
+  beta <- numeric(p)
+  S.star <- sample(1:p, p0)  # vrai support S*
+  beta[S.star] <- runif(p0, 1, 2) * sample(c(-1, 1), p0, replace = TRUE)
+  
+  # Génération des prédicteurs et du bruit
+  X <- matrix(rnorm(n * p), n, p)
+  noise <- rnorm(n, sd = sqrt(sigma2))
+  
+  # Génération des réponses
+  y <- X %*% beta + noise
+  
+  list(
+    y = y,
+    X = X,
+    beta = beta,
+    sigma2 = sigma2,
+    train = train,
+    test = test,
+    S.star = S.star
+  )
+}
+
+```
+
+##Génération des données simulées avec la fonction generate.lm 
+---
+```{r Génération des données simulées avec la fonction generate}
+set.seed(123)
+data.sim <- generate.lm(n.train = 100, p = 10, p0 = 3, sigma2 = 0.5)
+
+# Récupération des objets
+X <- data.sim$X
+y <- data.sim$y
+beta_true <- data.sim$beta
+S_star <- data.sim$S.star
+train <- data.sim$train
+test <- data.sim$test
+
+# --- Application des différentes méthodes ---
+beta_cp <- getBestSubsetCp(X[train, ], y[train])
+beta_aic_step <- getStepwiseAIC(X[train, ], y[train])
+beta_bic_step <- getStepwiseBIC(X[train, ], y[train])
+beta_ols <- getOLS(X[train, ], y[train])
+beta_oracle <- getOracleOLS(X[train, ], y[train], S_star)
+
+# --- Affichage des résultats ---
+cat("\nVrai beta:\n")
+print(round(beta_true, 3))
+
+cat("\nBest Subset (Cp):\n")
+print(round(beta_cp, 3))
+
+cat("\nStepwise AIC:\n")
+print(round(beta_aic_step, 3))
+
+cat("\nStepwise BIC:\n")
+print(round(beta_bic_step, 3))
+
+cat("\nOLS (complet):\n")
+print(round(beta_ols, 3))
+
+cat("\nOracle OLS:\n")
+print(round(beta_oracle, 3))
+
+
+library(tibble)
+```
+
+## Fonction d'eval de performance
+---
+```{r Fonction evaluation de performance}
+getPerformance <- function(X_test, y_test, beta, beta.star) {
+  
+  nzero <- which(beta != 0)
+  zero  <- which(beta == 0)
+  
+  true.nzero <- which(beta.star != 0)
+  true.zero  <- which(beta.star == 0)
+  
+  TP <- sum(nzero %in% true.nzero)
+  TN <- sum(zero %in%  true.zero)
+  FP <- sum(nzero %in% true.zero)
+  FN <- sum(zero %in%  true.nzero)
+  
+  recall       <- TP / (TP + FN)       # sensibilité
+  specificity  <- TN / (FP + TN)       # spécificité
+  precision    <- TP / (TP + FP)       # précision
+  
+  recall[TP + FN == 0] <- NA
+  specificity[TN + FP == 0] <- NA
+  precision[TP + FP == 0] <- NA
+  
+  rmse <- sqrt(mean((beta - beta.star)^2, na.rm = TRUE))
+  rerr <- sqrt(mean((y_test - X_test %*% beta)^2))
+  
+  res <- round(c(precision, recall, specificity, rmse, rerr), 4)
+  res[is.nan(res)] <- 0
+  names(res) <- c("precision", "recall", "specificity", "rmse", "prediction")
+  return(res)
+}
+
+getPerformance(data.sim$X, data.sim$y, data.sim$beta, beta_cp)
+getPerformance(data.sim$X, data.sim$y, data.sim$beta, unname(beta_aic_step[-1]))
+getPerformance(data.sim$X, data.sim$y, data.sim$beta, unname(beta_bic_step[-1]))
+getPerformance(data.sim$X, data.sim$y, data.sim$beta, unname(beta_ols[-1]))
+
+```
+
+
+
+```{r }
+set.seed(123)
+p <- 10
+n_values <- c(10, 100, 500, 1000)
+n_sim <- 50
+p0 <- 3      
+sigma2 <- 0.5
+
+
+rmse_list <- list()
+
+for (n_train in n_values) {
+  rmse_tmp <- numeric(n_sim)
+  
+  for (i in 1:n_sim) {
+   
+    data.sim <- generate.lm(n.train = n_train, p = p, p0 = p0, sigma2 = sigma2)
+    X <- data.sim$X
+    y <- data.sim$y
+    beta_true <- data.sim$beta
+    train <- data.sim$train
+    
+
+    beta_est <- getStepwiseBIC(X[train, ], y[train])
+    
+
+    perf <- getPerformance(X, y, beta_true, beta_est)
+    rmse_tmp[i] <- perf["rmse"]
+  }
+  
+  rmse_list[[as.character(n_train)]] <- rmse_tmp
+}
+
+
+rmse_df <- do.call(rbind,
+                   lapply(names(rmse_list), function(n_train) {
+                     data.frame(n_train = as.factor(n_train),
+                                rmse = rmse_list[[n_train]])
+                   }))
+```
+
+## Boxplot
+```{r Boxplot}
+ggplot(rmse_df, aes(x = n_train, y = rmse)) +
+  geom_boxplot(fill = "skyblue") +
+  labs(x = "Taille de l'échantillon (n)", y = "RMSE", 
+       title = "Distribution du RMSE pour test student selon n (50 simul)") +
+  theme_minimal()
+```
+
+
+## Objectif
+
+Comparer plusieurs méthodes de **sélection de variables** dans un modèle linéaire simulé **avec corrélation intra‑bloc** des prédicteurs :
+- **Best Subset (Cp de Mallows)**,
+- **Stepwise AIC / Stepwise BIC**,
+- **OLS** (avec filtrage par p‑value),
+- **Oracle** (connaissant le vrai support).
+
+Nous reportons : *precision*, *recall*, *specificity*, *RMSE des coefficients* et *RMSE de prédiction*.
+
+---
+
+## Génération des données (blocs corrélés)
+
+On simule \( y = X\beta + \varepsilon \), avec \(\varepsilon \sim \mathcal{N}(0,\sigma^2)\).  
+Les \(p\) variables sont réparties en \(K\) blocs ; dans chaque bloc actif, les colonnes sont corrélées (équicorrélation \(\rho\)).
+
+```{r data-generation}
+split_p_in_K_blocks <- function(p, K) {
+  sizes <- rep(floor(p / K), K)
+  remainder <- p %% K
+  if (remainder > 0) sizes[1:remainder] <- sizes[1:remainder] + 1
+  idx <- vector("list", K); start <- 1
+  for (k in seq_len(K)) {
+    end <- start + sizes[k] - 1
+    idx[[k]] <- seq.int(start, end)
+    start <- end + 1
+  }
+  list(idxs = idx, sizes = sizes)
+}
+
+equicorr_matrix <- function(m, rho) {
+  if (m == 1) return(matrix(1, 1, 1))
+  M <- matrix(rho, nrow = m, ncol = m); diag(M) <- 1
+  M
+}
+
+clip_rho_for_block <- function(m, rho, eps = 1e-10) {
+  if (m <= 1) return(rho)
+  lower <- -1 / (m - 1) + eps
+  upper <- 1 - eps
+  min(max(rho, lower), upper)
+}
+
+gen_block_X <- function(n, m, rho_active) {
+  rho_safe <- clip_rho_for_block(m, rho_active)
+  Sigma_block <- equicorr_matrix(m, rho_safe)
+  R <- chol(Sigma_block + 1e-12 * diag(m))
+  Z <- matrix(rnorm(n * m), nrow = n, ncol = m)
+  X_block <- Z %*% R
+  list(X_block = X_block, Sigma_block = Sigma_block)
+}
+
+.generate_once_bloc <- function(n, p, K0, sigma2, rho, K,
+                                active_idx = NULL, s_per_block = 1, beta_val = 1) {
+  rho_vec <- if (length(rho) == 1) rep(rho, K) else rho
+  if (is.null(active_idx)) active_idx <- if (K0 > 0) seq_len(K0)
+  
+  parts <- split_p_in_K_blocks(p, K)
+  idx_blocks <- parts$idxs
+  
+  X <- matrix(NA, nrow = n, ncol = p)
+  Sigma_X <- matrix(0, nrow = p, ncol = p)
+  
+  for (k in seq_len(K)) {
+    cols <- idx_blocks[[k]]
+    m <- length(cols)
+    rho_k <- if (k %in% active_idx) rho_vec[k] else 0
+    gb <- gen_block_X(n, m, rho_k)
+    X[, cols] <- gb$X_block
+    Sigma_X[cols, cols] <- gb$Sigma_block
+  }
+  
+  beta <- rep(0, p)
+  if (K0 > 0) {
+    for (k in active_idx) {
+      cols <- idx_blocks[[k]]
+      s_use <- min(s_per_block, length(cols))
+      beta[cols[seq_len(s_use)]] <- beta_val
+    }
+  }
+  
+  eps <- rnorm(n, mean = 0, sd = sqrt(sigma2))
+  y <- as.numeric(X %*% beta + eps)
+  list(X = X, y = y, beta = beta, Sigma = Sigma_X,
+       blocks = idx_blocks, active_blocks = active_idx)
+}
+
+generate.lm.bloc <- function(n.train, p, K0, sigma2, rho, K,
+                             n.test = 10 * n.train,
+                             seed = NULL,
+                             s_per_block = 1,
+                             beta_val = 1) {
+  if (!is.null(seed)) set.seed(seed)
+  train <- .generate_once_bloc(n = n.train, p = p, K0 = K0,
+                               sigma2 = sigma2, rho = rho, K = K,
+                               s_per_block = s_per_block, beta_val = beta_val)
+  test <- .generate_once_bloc(n = n.test, p = p, K0 = K0,
+                              sigma2 = sigma2, rho = rho, K = K,
+                              active_idx = train$active_blocks,
+                              s_per_block = s_per_block, beta_val = beta_val)
+  test$beta <- train$beta
+  list(train = train, test = test, beta = train$beta)
+}
+
+# --- Simulation ---
+set.seed(123)
+data.sim <- generate.lm.bloc(n.train = 100, p = 10, K0 = 3, sigma2 = 0.5, rho = 0.6, K = 10)
+Xtr <- data.sim$train$X; ytr <- as.numeric(data.sim$train$y)
+Xte <- data.sim$test$X;  yte <- as.numeric(data.sim$test$y)
+beta_true <- data.sim$beta
+S_star    <- which(beta_true != 0)
+```
+
+---
+
+## Méthodes de sélection
+
+```{r methods}
+
+getBestSubsetCp <- function(X, y) {
+  if (is.null(colnames(X))) colnames(X) <- paste0("V", 1:ncol(X))
+  data <- data.frame(y = as.numeric(y), X)
+  regfit <- leaps::regsubsets(y ~ ., data = data, nvmax = ncol(X), method = "exhaustive")
+  reg_summary <- summary(regfit)
+  best_model_idx <- which.min(reg_summary$cp)
+  selected_vars <- reg_summary$which[best_model_idx, -1]  
+  p <- ncol(X); beta <- rep(0, p)
+  if (sum(selected_vars) > 0) {
+    X_selected <- X[, selected_vars, drop = FALSE]
+    df_sel <- data.frame(y = as.numeric(y), X_selected)
+    fit <- lm(y ~ ., data = df_sel)
+    beta[selected_vars] <- coef(fit)[-1]
+  }
+  beta
+}
+
+
+getStepwiseAIC <- function(X, y) {
+  if (is.null(colnames(X))) colnames(X) <- paste0("V", 1:ncol(X))
+  data <- data.frame(y = as.numeric(y), X)
+  model_init <- lm(y ~ 1, data = data)
+  model_full <- lm(y ~ ., data = data)
+  model_step <- step(model_init,
+                     scope = list(lower = model_init, upper = model_full),
+                     direction = "forward",
+                     k = 2, trace = 0)
+  coef(model_step) 
+}
+
+
+getStepwiseBIC <- function(X, y) {
+  if (is.null(colnames(X))) colnames(X) <- paste0("V", 1:ncol(X))
+  data <- data.frame(y = as.numeric(y), X)
+  model_init <- lm(y ~ 1, data = data)
+  model_full <- lm(y ~ ., data = data)
+  n <- length(y)
+  model_step <- step(model_full,
+                     scope = list(lower = model_init, upper = model_full),
+                     direction = "backward",
+                     k = log(n), trace = 0)
+  coef(model_step)  
+}
+
+
+getOLS <- function(X, y, alpha = 0.05) {
+  if (is.null(colnames(X))) colnames(X) <- paste0("V", 1:ncol(X))
+  data <- data.frame(y = as.numeric(y), X)
+  fit  <- lm(y ~ ., data = data)
+  summ <- summary(fit)
+  pvals <- summ$coefficients[, "Pr(>|t|)"]
+  beta  <- rep(0, ncol(X) + 1)
+  names(beta) <- c("Intercept", colnames(X))
+  beta[1] <- coef(fit)[1]
+  if (length(pvals) > 1) {
+    keep <- which(pvals[-1] < alpha)
+    if (length(keep) > 0) beta[keep + 1] <- coef(fit)[-1][keep]
+  }
+  beta 
+}
+
+getOracleOLS <- function(X, y, S_star) {
+  p <- ncol(X); beta <- rep(0, p)
+  if (length(S_star) > 0) {
+    X_oracle <- X[, S_star, drop = FALSE]
+    fit <- lm(y ~ X_oracle)
+    beta[S_star] <- coef(fit)[-1]
+  }
+  beta
+}
+
+
+split_intercept <- function(beta_with_intercept) {
+  list(
+    intercept = as.numeric(beta_with_intercept[1]),
+    beta      = beta_with_intercept[-1]
+  )
+}
+
+
+align_beta_to_X <- function(beta_named, X) {
+  p <- ncol(X)
+  out <- numeric(p)
+  cn <- colnames(X)
+  if (is.null(cn)) cn <- paste0("V", seq_len(p))
+  colnames(X) <- cn
+  idx <- match(names(beta_named), cn)
+  keep <- !is.na(idx)
+  if (any(keep)) out[idx[keep]] <- as.numeric(beta_named[keep])
+  out
+}
+
+
+getPerformance <- function(X_test, y_test,
+                           beta_hat, beta_true,
+                           intercept = 0, tol = 1e-12) {
+  if (ncol(X_test) != length(beta_hat))
+    stop("Dimensions incompatibles.")
+  if (length(beta_true) != length(beta_hat))
+    stop("beta_true et beta_hat doivent avoir la même longueur.")
+  sel <- which(abs(beta_hat)  > tol)
+  tru <- which(abs(beta_true) > tol)
+  TP <- length(intersect(sel, tru))
+  FP <- length(setdiff(sel, tru))
+  FN <- length(setdiff(tru, sel))
+  TN <- length(beta_true) - TP - FP - FN
+  precision   <- if ((TP + FP) == 0) NA_real_ else TP / (TP + FP)
+  recall      <- if ((TP + FN) == 0) NA_real_ else TP / (TP + FN)
+  specificity <- if ((TN + FP) == 0) NA_real_ else TN / (TN + FP)
+  rmse_coef <- sqrt(mean((beta_hat - beta_true)^2, na.rm = TRUE))
+  yhat <- as.numeric(intercept + X_test %*% beta_hat)
+  rmse_pred <- sqrt(mean((y_test - yhat)^2))
+  round(c(precision = precision, recall = recall, specificity = specificity,
+          rmse = rmse_coef, prediction = rmse_pred), 4)
+}
+```
+
+---
+
+## Évaluation
+
+```{r performance}
+
+
+
+beta_cp       <- getBestSubsetCp(Xtr, ytr)           
+beta_aic_step <- getStepwiseAIC(Xtr, ytr)           
+beta_bic_step <- getStepwiseBIC(Xtr, ytr)            
+beta_ols      <- getOLS(Xtr, ytr)                   
+beta_oracle   <- getOracleOLS(Xtr, ytr, S_star) 
+
+
+ai <- split_intercept(beta_aic_step)
+bi <- split_intercept(beta_bic_step)
+oi <- split_intercept(beta_ols)
+
+
+beta_ai_aligned <- align_beta_to_X(ai$beta, Xtr)
+beta_bi_aligned <- align_beta_to_X(bi$beta, Xtr)
+beta_oi_aligned <- align_beta_to_X(oi$beta, Xtr)  
+
+
+perf_df <- data.frame(
+  method = c("Cp", "AIC", "BIC", "OLS", "Oracle"),
+  rbind(
+    getPerformance(Xte, yte, beta_cp,         beta_true, 0),
+    getPerformance(Xte, yte, beta_ai_aligned, beta_true, ai$intercept),
+    getPerformance(Xte, yte, beta_bi_aligned, beta_true, bi$intercept),
+    getPerformance(Xte, yte, beta_oi_aligned, beta_true, oi$intercept),
+    getPerformance(Xte, yte, beta_oracle,     beta_true, 0)
+  ),
+  row.names = NULL
+)
+perf_df
+```
+
+---
+
+## Visualisation
+
+```{r plot, echo=FALSE, message=FALSE, warning=FALSE}
+perf_long <- tidyr::pivot_longer(perf_df, cols = -method,
+                                 names_to = "metric", values_to = "value")
+
+ggplot(perf_long, aes(x = method, y = value, fill = method)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~metric, scales = "free_y") +
+  theme_minimal(base_size = 13) +
+  labs(title = "Performances des méthodes de sélection (blocs corrélés)",
+       y = "Valeur", x = "Méthode")
+```
+
+---
+
+## Conclusion
+
+- **AIC/Cp** : rappel élevé mais tendance à sur‑sélectionner (précision < 1).  
+- **BIC/OLS** : très proches de l’Oracle sur ce jeu corrélé (\(\rho=0.6\)).  
+- L’erreur de prédiction observée est cohérente avec le bruit simulé (\(\sigma = \sqrt{0.5}\)).
+
+*Pistes :* répéter l’expérience pour différentes valeurs de \(\rho\), augmenter \(p\), comparer à **Lasso/Ridge**.
