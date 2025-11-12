@@ -1,0 +1,115 @@
+---
+title: "partie 3"
+author: "Anziza"
+date: "2025-11-12"
+output: html_document
+---
+
+```{r}
+perf <- function(X_test, y_test, beta, beta.star) {
+  
+  nzero <- which(beta != 0)#variables selectionnées
+  zero  <- which(beta == 0)#non selectionnées 
+  
+  true.nzero <- which(beta.star != 0)#pareil 
+  true.zero  <- which(beta.star == 0)
+  
+  TP <- sum(nzero %in% true.nzero)#variables correctement sélectionnées,
+  TN <- sum(zero %in%  true.zero)#variables correctement écartées,
+  FP <- sum(nzero %in% true.zero)#variables sélectionnées à tort,
+  FN <- sum(zero %in%  true.nzero)#variables manquées,
+  
+  recall    <- TP/(TP + FN) ## also recall and sensitivity (sensibilité)
+  specificity   <- TN/(FP + TN) ## specificity(spécificité)
+  precision <- TP/(TP + FP) ## also PPR (précision)
+  recall[TP + FN == 0] <- NA
+  specificity[TN + FP == 0] <- NA
+  precision[TP + FP == 0] <- NA
+
+  rmse <- sqrt(mean((beta - beta.star)^2, na.rm = TRUE))#errreur quadratique (mesure la qualité de l'estimation de Beta)
+  rerr <- sqrt(mean((y_test - X_test %*% beta)^2))#errreurs de prédiction  (mesure la capacité prédictive)
+  
+  res <-  round(c(precision,recall,specificity, rmse, rerr),4)#
+  res[is.nan(res)] <- 0
+  names(res) <- c("precision","recall","specificity","rmse", "prediction") 
+  res
+}
+```
+
+#1er test :
+
+```{r}
+
+set.seed(123)  # pour la reproductibilité
+
+n <- 100       # nombre d'observations
+p <- 20        # nombre de variables prédictives
+
+# Vrai vecteur de coefficients (beta*)
+beta.star <- c(runif(5, 1, 3), rep(0, p - 5))  # 5 variables actives seulement
+
+# Matrice de données
+X_test <- matrix(rnorm(n * p), nrow = n, ncol = p)
+
+# Réponse avec un peu de bruit
+y_test <- X_test %*% beta.star + rnorm(n, 0, 1)
+
+# Estimation fictive (beta chapeau)
+# On suppose que la méthode a sélectionné quelques variables, mais pas parfaitement
+beta.hat <- beta.star + rnorm(p, 0, 0.5) #(coefficients estimés par la méthode ,sert à évaluer la méthode)
+beta.hat[sample(1:p, 10)] <- 0  # certaines mises à zéro pour simuler de la sélection
+
+
+# Fonction de performance
+
+getPerformance <- function(X_test, y_test, beta, beta.star) {
+  
+  nzero <- which(beta != 0)
+  zero  <- which(beta == 0)
+  
+  true.nzero <- which(beta.star != 0)
+  true.zero  <- which(beta.star == 0)
+  
+  TP <- sum(nzero %in% true.nzero)
+  TN <- sum(zero %in%  true.zero)
+  FP <- sum(nzero %in% true.zero)
+  FN <- sum(zero %in%  true.nzero)
+  
+  recall    <- TP/(TP + FN)      # sensibilité
+  specificity <- TN/(FP + TN)    # spécificité
+  precision <- TP/(TP + FP)      # précision
+  
+  recall[TP + FN == 0] <- NA
+  specificity[TN + FP == 0] <- NA
+  precision[TP + FP == 0] <- NA
+  
+  rmse <- sqrt(mean((beta - beta.star)^2, na.rm = TRUE))
+  rerr <- sqrt(mean((y_test - X_test %*% beta)^2))
+  
+  res <- round(c(precision, recall, specificity, rmse, rerr), 4)
+  res[is.nan(res)] <- 0
+  names(res) <- c("precision","recall","specificity","rmse","prediction") 
+  res
+}
+
+
+###  Test
+
+
+getPerformance(X_test, y_test, beta.hat, beta.star)
+
+```
+#interpretation du 1er test : 
+
+Dans cette partie, j’ai développé une fonction getPerformance() permettant d’évaluer la qualité des méthodes de sélection de variables.
+Elle calcule cinq indicateurs : précision, sensibilité, spécificité, RMSE et erreur de prédiction, à partir des coefficients estimés (β̂), des vrais coefficients (β*), et des données test (X_test, y_test).
+En attendant les résultats du groupe, j’ai généré des données simulées pour tester la fonction : un modèle avec 5 variables actives sur 20, des données aléatoires et un estimateur fictif.
+Les résultats obtenus montrent que la fonction fonctionne correctement et permet d’analyser à la fois la capacité prédictive et la pertinence de la sélection de variables des différentes méthodes.
+
+#2em test : 
+
+```{r}
+
+```
+
+
